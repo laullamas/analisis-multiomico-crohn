@@ -1,0 +1,175 @@
+---
+title: "Selección de muestras para RNA-seq desde GEO y SRA"
+author: "María Sánchez Vivo"
+date: "2026-04-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introducción
+
+En este archivo se realiza la selección de muestras de RNA-seq a partir de bases de datos públicas, concretamente GEO (Gene Expression Omnibus) y SRA (Sequence Read Archive).
+
+El objetivo es identificar un conjunto equilibrado de muestras correspondientes a pacientes con la enfermedad de Crohn (CD) y controles, asegurando además una calidad adecuada de los datos de secuenciación.
+
+Para ello, se integran datos de ambas fuentes, se filtran según criterios biológicos y técnicos, y se completa la información con metadatos adicionales como edad y sexo.
+
+
+## Carga de librerías
+
+Se cargan las librerías necesarias para la descarga, manipulación y análisis de datos.
+
+```{r}
+library(GEOquery)
+library(rentrez)
+library(dplyr)
+library(stringr)
+library(rvest)
+library(readr)
+```
+
+## Descarga de datos desde GEO
+
+Se descargan los datos del estudio GSE193677 desde GEO, obteniendo la información fenotípica de las muestras.
+
+```{r}
+gse <- getGEO("GSE193677", GSEMatrix = TRUE)
+data_GEO <- pData(phenoData(gse[[1]]))
+data_GEO <- data_GEO %>%
+  mutate(Accession = geo_accession) %>%
+  select(Accession, Title = title, everything())
+cat("Número de muestras GEO descargadas:", nrow(data_GEO), "\n")
+```
+
+## Descarga de datos desde SRA
+
+Se obtienen los registros asociados al proyecto PRJNA797175 desde SRA, incluyendo información sobre la calidad de secuenciación (número de lecturas, bases, etc.).
+
+```{r}
+search_res <- entrez_search(db="sra", term="PRJNA797175", use_history=TRUE, retmax=0)
+cat("Total SRA records:", search_res$count, "\n")
+
+sra_csv <- entrez_fetch(
+  db="sra",
+  web_history = search_res$web_history,
+  rettype="runinfo",
+  retmax = search_res$count
+)
+
+sra_runinfo <- read.csv(text = sra_csv, stringsAsFactors = FALSE)
+sra_runinfo <- sra_runinfo %>% select(SampleName, everything())
+cat("Número de SRA runs obtenidos:", nrow(sra_runinfo), "\n")
+```
+
+## Filtrado y selección de muestras
+
+Se filtran las muestras de GEO para conservar únicamente aquellas que tienen correspondencia en SRA.
+
+Posteriormente, se separan en dos grupos:
+- Pacientes con enfermedad de Crohn (CD)
+- Controles sanos
+
+Esto se realiza mediante búsqueda de patrones en los títulos de las muestras.
+
+```{r}
+data_filtrada <- data_GEO %>% filter(Accession %in% sra_runinfo$SampleName)
+
+cd <- data_filtrada %>%
+  filter(str_detect(Title, regex("Ileum I tissue", ignore_case = TRUE)),
+         str_detect(Title, regex("CD", ignore_case = TRUE)))
+
+control <- data_filtrada %>%
+  filter(str_detect(Title, regex("Ileum NonI tissue", ignore_case = TRUE)),
+         str_detect(Title, regex("Control", ignore_case = TRUE)))
+```
+
+## Integración con datos de calidad
+
+Se incorporan métricas de calidad de SRA, como el número de lecturas (spots), para poder filtrar muestras con suficiente profundidad de secuenciación.
+
+```{r}
+cd <- cd %>% left_join(sra_runinfo %>% select(SampleName, spots, bases, avgLength), 
+                       by = c("Accession" = "SampleName"))
+control <- control %>% left_join(sra_runinfo %>% select(SampleName, spots, bases, avgLength), 
+                                 by = c("Accession" = "SampleName"))
+```
+
+## Filtrado por calidad y selección equilibrada
+
+Se seleccionan únicamente las muestras con un número de lecturas adecuado (entre 30 y 50 millones).
+
+Después, se eligen 4 muestras de cada grupo de forma equilibrada para evitar sesgos en el análisis.
+
+```{r}
+cd <- cd %>% filter(spots > 30000000 & spots < 50000000) %>% arrange(desc(spots))
+n_cd <- nrow(cd)
+control <- control %>% filter(spots > 30000000 & spots < 50000000) %>% arrange(desc(spots))
+n_control <- nrow(control)
+
+cd_4 <- cd %>% slice(c(1, round(2*n_cd/3), round(2.75*n_cd/3), n_cd))
+control_4 <- control %>% slice(c(1, round(n_control/3), round(2*n_control/3), n_control))
+
+final_accessions <- c(cd_4$Accession, control_4$Accession)
+```
+
+## Extracción de metadatos
+
+Se realiza web scraping de GEO para obtener información adicional de las muestras, como la edad y el sexo de los individuos.
+
+```{r}
+extraer_metadata <- function(accession) {
+  url <- paste0("https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=", accession)
+  tryCatch({
+    webpage <- read_html(url)
+    texto <- webpage %>% html_text()
+    
+    age <- str_extract(texto, "(?i)study_eligibility_age_at_endo[^0-9]{0,10}[0-9]+")
+    age <- str_extract(age, "[0-9]+")
+    
+    sex <- str_extract(texto, "(?i)demographics_gender[^a-zA-Z]{0,10}(male|female)")
+    sex <- str_extract(sex, "(?i)male|female")
+    sex <- str_to_title(sex)
+    
+    return(data.frame(Accession = accession, Age = age, Sex_new = sex))
+  }, error = function(e) {
+    return(data.frame(Accession = accession, Age = NA, Sex_new = NA))
+  })
+}
+
+metadata <- bind_rows(lapply(final_accessions, extraer_metadata))
+```
+
+## Construcción de tablas finales
+
+Se generan dos tablas finales, una con información de GEO y otra con información de SRA, en las que se incluyen los metadatos adicionales obtenidos.
+
+```{r}
+# Columnas a conservar, en orden:
+columnas_deseadas <- c("Accession", "Title", "type", "organism_ch1", "channel_count",
+                       "platform_id", "relation.1", "contact_name", "status")
+
+samples_GEO_final <- data_GEO %>%
+  filter(Accession %in% final_accessions) %>%
+  select(all_of(columnas_deseadas)) %>%
+  left_join(metadata, by = "Accession") %>%
+  rename(Sex = Sex_new)  # Age ya está incluida como columna nueva
+
+
+SraRunInfo_final <- sra_runinfo %>%
+  filter(SampleName %in% final_accessions) %>%
+  left_join(metadata, by = c("SampleName" = "Accession")) %>%
+  mutate(Sex = coalesce(Sex, Sex_new)) %>%  # Rellenar Sex existente
+  select(-Sex_new)
+```
+
+## Exportación de resultados
+
+Finalmente, se guardan las tablas generadas en archivos CSV para su uso en análisis posteriores.
+
+```{r}
+write.csv(samples_GEO_final, "samples_GEO_Final.csv", row.names = FALSE)
+write.csv(SraRunInfo_final, "SraRunInfo_Final.csv", row.names = FALSE)
+```

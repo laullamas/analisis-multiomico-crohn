@@ -1,0 +1,9 @@
+Accession;Title;type;organism_ch1;channel_count;platform_id;relation.1;contact_name;status;Age;Sex
+GSM5976576;MSCCR_reGRID_1048_Biopsy_1793, Control participants,Ileum NonI tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14640276;Carmen,,argmann;Public on Sep 16 2022;55;Female
+GSM5976801;MSCCR_reGRID_1187_Biopsy_1984, CD participants,Ileum I tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14641390;Carmen,,argmann;Public on Sep 16 2022;34;Female
+GSM5976985;MSCCR_reGRID_1370_Biopsy_2130, Control participants,Ileum NonI tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14641444;Carmen,,argmann;Public on Sep 16 2022;50;Male
+GSM5977100;MSCCR_reGRID_1446_Biopsy_2231, CD participants,Ileum I tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14641487;Carmen,,argmann;Public on Sep 16 2022;31;Male
+GSM5977177;MSCCR_reGRID_1501_Biopsy_2296, CD participants,Ileum I tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14640445;Carmen,,argmann;Public on Sep 16 2022;35;Male
+GSM5977472;MSCCR_reGRID_199_Biopsy_384, CD participants,Ileum I tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14642555;Carmen,,argmann;Public on Sep 16 2022;28;Female
+GSM5978421;MSCCR_reGRID_644_Biopsy_1241, Control participants,Ileum NonI tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14642207;Carmen,,argmann;Public on Sep 16 2022;42;Male
+GSM5978855;MSCCR_reGRID_899_Biopsy_1624, Control participants,Ileum NonI tissue;SRA;Homo sapiens;1;GPL16791;SRA: https://www.ncbi.nlm.nih.gov/sra?term=SRX14641283;Carmen,,argmann;Public on Sep 16 2022;51;Female

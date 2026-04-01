@@ -1,0 +1,104 @@
+---
+title: "Volcano"
+author: "Laura Llamas López y María Sánchez Vivo"
+date: "2026-04-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introducción
+
+En este análisis se estudian los resultados de expresión génica diferencial obtenidos mediante DESeq2. El objetivo es identificar genes significativamente regulados entre dos condiciones experimentales: CD y Control.
+
+Para ello, se construye un volcano plot, que permite visualizar simultáneamente la magnitud del cambio (log2 Fold Change) y la significancia estadística (-log10 del p-valor ajustado).
+
+
+## Carga de librerías
+
+Se utilizan las librerías `ggplot2` para la visualización y `ggrepel` para mejorar la legibilidad de las etiquetas en el gráfico.
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+```
+
+## Importación de datos
+
+Los datos se importan desde un archivo tabular generado previamente, que contiene información sobre genes, cambios de expresión y valores p ajustados.
+
+```{r}
+data <- read.table("Galaxy94-DESeq2.tabular", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+```
+
+## Preprocesamiento de datos
+
+Se seleccionan las columnas relevantes (GeneID, log2 Fold Change y p-valor ajustado) y se convierten a formato numérico para su análisis.
+
+Posteriormente, se clasifica cada gen en tres categorías:
+- Genes significativamente sobreexpresados en CD
+- Genes significativamente sobreexpresados en Control
+- Genes no significativos
+
+Se considera significancia estadística cuando el p-valor ajustado es menor a 0.05.
+
+```{r}
+data_subset <- data[, c("GeneID", "log2.FC.", "P.adj")]
+
+data_subset$P.adj <- as.numeric(data_subset$P.adj)
+data_subset$log2.FC. <- as.numeric(data_subset$log2.FC.)
+
+# Crear columna Status para categorías
+data_subset$Status <- "Not Significant"
+data_subset$Status[data_subset$P.adj < 0.05 & data_subset$log2.FC. > 0] <- "Upregulated in CD"
+data_subset$Status[data_subset$P.adj < 0.05 & data_subset$log2.FC. < 0] <- "Upregulated in Control"
+
+# Subconjunto solo con genes significativos para etiquetas
+sig_genes <- subset(data_subset, P.adj < 0.05)
+```
+
+## Visualización: Volcano Plot
+
+Se genera un volcano plot para representar los resultados. En este gráfico:
+
+- El eje X muestra el log2 Fold Change
+- El eje Y muestra la significancia (-log10 del p-valor ajustado)
+- Los colores indican la categoría de regulación de cada gen
+- Se etiquetan únicamente los genes significativamente regulados para mejorar la interpretación
+
+Además, se incluyen líneas de referencia para:
+- Fold change = 0
+- p-valor ajustado = 0.05
+
+```{r}
+# Definir colores
+colors <- c("Upregulated in CD" = "red",
+            "Upregulated in Control" = "blue",
+            "Not Significant" = "grey70")
+
+# Plot con etiquetas solo en genes significativos
+ggplot(data_subset, aes(x = log2.FC., y = -log10(P.adj), color = Status)) +
+  geom_point(alpha = 0.7, size = 2) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  geom_text_repel(data = sig_genes,
+                  aes(label = GeneID),
+                  size = 3,
+                  box.padding = 0.4,
+                  point.padding = 0.3,
+                  max.overlaps = 20) +  # Ajusta para evitar demasiados solapamientos
+  
+  scale_color_manual(values = colors) +
+  labs(title = "Volcano Plot: CD vs Control",
+       x = "Log2 Fold Change",
+       y = "-Log10 adjusted p-value",
+       color = "") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+En base a los resultados, se observa que la mayoría de los genes no presentan cambios significativos, concentrándose cerca de log2FC = 0 y valores bajos de significancia. Sin embargo, algunos genes destacan como diferencialmente expresados: a la derecha (en rojo), genes sobreexpresados en CD con cambios positivos y significativos; y a la izquierda (en azul), genes sobreexpresados en el grupo control con cambios negativos y alta significancia. En particular, los puntos más alejados del centro y por encima del umbral de significancia (línea horizontal) representan los genes más relevantes biológicamente, indicando que aunque el número de genes diferencialmente expresados es limitado, existen candidatos claros con cambios marcados entre ambas condiciones.

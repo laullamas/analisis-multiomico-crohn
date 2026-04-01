@@ -19,10 +19,10 @@ analisis-multiomico-crohn/
 ```
 transcriptomica_mod_a/
 ├── Databases/                   # Metadatos y ficheros SraRunInfo descargados de GEO/SRA
-├── Extraer muestras/            # Scripts de selección y filtrado de muestras
+├── Extraer muestras/            # Scripts de selección y filtrado de muestras (R Markdown)
 ├── Galaxy/                      # Resultados del análisis DESeq2 ejecutado en Galaxy
-├── Volcano/                     # Generación del Volcano plot
-└── Nextflow Transcriptomica/    # Pipeline Nextflow DSL2
+├── Volcano/                     # Volcano plot (R Markdown + script)
+└── Nextflow_moduloA.zip         # Pipeline Nextflow DSL2 (comprimido para despliegue en servidor)
 ```
 
 ## Módulo B — Metagenómica (`metagenomica_mod_b/`)
@@ -32,6 +32,6 @@ metagenomica_mod_b/
 ├── seleccion_muestras/          # Selección y filtrado de muestras (R Markdown)
 ├── nextflow_metagenomica/       # Pipeline Nextflow DSL2 
 ├── analisis_metagenomico/       # Análisis estadístico y figuras (R Markdown)
-└── multiqc_reports/             # Informes MultiQC: QC raw (Falco), post-trimming (fastp) y alineamiento (Bowtie2)
+└── multiqc_reports/             # Informes MultiQC
 ```
 
