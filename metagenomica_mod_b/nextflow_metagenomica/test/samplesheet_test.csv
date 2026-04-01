@@ -1,0 +1,3 @@
+sample,fastq_1,fastq_2,group
+SRR5947807,/tmp/test_R1.fastq.gz,/tmp/test_R2.fastq.gz,CD
+SRR5983422,/tmp/test_R1.fastq.gz,/tmp/test_R2.fastq.gz,CD

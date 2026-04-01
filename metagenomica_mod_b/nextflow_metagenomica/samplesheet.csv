@@ -1,0 +1,9 @@
+sample,fastq_1,fastq_2,group
+SRR5947807,data/SRR5947807_1.fastq.gz,data/SRR5947807_2.fastq.gz,CD
+SRR5947820,data/SRR5947820_1.fastq.gz,data/SRR5947820_2.fastq.gz,nonIBD
+SRR5947862,data/SRR5947862_1.fastq.gz,data/SRR5947862_2.fastq.gz,CD
+SRR5983266,data/SRR5983266_1.fastq.gz,data/SRR5983266_2.fastq.gz,CD
+SRR5983267,data/SRR5983267_1.fastq.gz,data/SRR5983267_2.fastq.gz,nonIBD
+SRR5983276,data/SRR5983276_1.fastq.gz,data/SRR5983276_2.fastq.gz,nonIBD
+SRR5983301,data/SRR5983301_1.fastq.gz,data/SRR5983301_2.fastq.gz,nonIBD
+SRR5983422,data/SRR5983422_1.fastq.gz,data/SRR5983422_2.fastq.gz,CD

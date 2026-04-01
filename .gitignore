@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Nextflow
+work/
+.nextflow/
+.nextflow.log*
+
+# Resultados intermedios
+results/
+
+# Archivos grandes de secuenciación
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.sam
+
+# Archivos temporales
+*.tmp
+*.log

@@ -1,0 +1,403 @@
+---
+title: "Módulo B — Selección de muestras metagenómicas"
+subtitle: "PRJNA389280 · IBDMDB/HMP2 (Lloyd-Price et al., Nature 2019)"
+author: "Laura Llamas López · María Sánchez Vivo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Introducción
+
+Este documento realiza desde cero la selección de las **8 muestras** de metagenómica
+shotgun (4 CD + 4 nonIBD) empleadas en el pipeline del Módulo B del trabajo práctico
+de Análisis de Datos Ómicos (Máster en Bioinformática, UMU).
+
+El estudio de referencia es el **Human Intestinal Bacterial-Microbiome Disease
+(IBDMDB)**, también denominado HMP2 (Lloyd-Price et al., *Nature* 2019,
+doi: 10.1038/s41586-019-1237-9). Los datos están depositados en NCBI SRA bajo el
+BioProject [PRJNA389280](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA389280).
+
+El proceso sigue estas etapas:
+
+1. Librerías
+2. Carga del RunInfo de SRA (metadatos técnicos)
+3. Filtrado a metagenómica shotgun
+4. Carga de metadatos clínicos del IBDMDB
+5. Cruce de las dos tablas
+6. Criterios de selección
+7. Selección final: 4 CD + 4 nonIBD
+8. Resumen demográfico
+9. Guardado de resultados
+10. Accesiones para descarga en Galaxy
+
+# Librerías
+
+```{r librerias}
+library(dplyr)
+library(readr)
+library(stringr)
+library(jsonlite)
+```
+
+# Carga del RunInfo de SRA
+
+El **SRA Run Selector** de NCBI
+(<https://www.ncbi.nlm.nih.gov/Traces/study/?acc=PRJNA389280>) permite
+descargar una tabla con todos los runs del proyecto bajo el BioProject
+PRJNA389280. El archivo `SraRunInfo_PRJNA389280.csv` contiene los metadatos
+**técnicos** de cada run (accesión SRR, tamaño en MB, plataforma, tipo de
+librería, BioSample asociado, longitud media de lectura…), pero **no contiene
+el diagnóstico clínico** — esa información reside en los metadatos del estudio
+IBDMDB y se incorpora en la sección de cruce de tablas.
+
+> **Gestión de datos:** el archivo se incluye junto a este documento para
+> garantizar la reproducibilidad sin depender de conectividad. Si no se
+> encuentra en local, el código lo descarga automáticamente desde la API
+> Entrez de NCBI (esearch + efetch en lotes de 100, respetando el límite de
+> 3 peticiones/segundo) y lo guarda en disco; las ejecuciones posteriores
+> usarán siempre la copia local.
+
+```{r carga_sra}
+LOCAL_SRA <- "SraRunInfo_PRJNA389280.csv"
+
+if (!file.exists(LOCAL_SRA)) {
+  cat("Descargando RunInfo de PRJNA389280 desde NCBI SRA...\n")
+
+  # 1) Obtener IDs de todos los runs del proyecto
+  ids <- fromJSON(
+    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=sra&term=PRJNA389280&retmax=500&retmode=json"
+  )$esearchresult$idlist
+  cat("IDs encontrados:", length(ids), "\n")
+
+  # 2) Descargar RunInfo en lotes de 100 (límite recomendado por NCBI)
+  chunks <- list()
+  for (i in seq(1, length(ids), by = 100)) {
+    batch <- paste(ids[i:min(i + 99, length(ids))], collapse = ",")
+    fetch_url <- paste0(
+      "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+      "?db=sra&id=", batch, "&rettype=runinfo&retmode=text"
+    )
+    chunks[[length(chunks) + 1]] <- read_csv(url(fetch_url), show_col_types = FALSE)
+    Sys.sleep(0.4)
+  }
+
+  sra_raw <- bind_rows(chunks)
+  write_csv(sra_raw, LOCAL_SRA)
+  cat("Guardado:", LOCAL_SRA, "(", nrow(sra_raw), "runs)\n")
+}
+
+sra <- read_csv(LOCAL_SRA, show_col_types = FALSE) |>
+  filter(!is.na(Run), Run != "")
+
+cat("Runs cargados:", nrow(sra), "\n")
+sra |> select(Run, SampleName, LibraryStrategy, LibrarySource,
+              LibraryLayout, Platform, size_MB, avgLength) |> head(3)
+```
+
+# Filtrado a metagenómica shotgun
+
+Se conservan solo los runs de metagenómica shotgun:
+estrategia WGS, fuente METAGENOMIC, layout PAIRED.
+
+```{r filtro_mgx}
+sra_mgx <- sra |>
+  filter(
+    LibraryStrategy == "WGS",
+    LibrarySource   == "METAGENOMIC",
+    LibraryLayout   == "PAIRED"
+  )
+
+cat("Runs metagenómica shotgun PE:", nrow(sra_mgx), "\n")
+cat("Plataforma:", paste(unique(sra_mgx$Platform), collapse = ", "), "\n")
+cat("Longitud media de read (bp):", round(mean(sra_mgx$avgLength, na.rm = TRUE)), "\n")
+```
+
+# Carga de metadatos clínicos — IBDMDB
+
+El archivo `hmp2_metadata_2018-08-20.csv` se distribuye junto al artículo de
+Lloyd-Price et al. (2019) y contiene metadatos clínicos y demográficos de todos
+los participantes y visitas del IBDMDB.
+
+> **Gestión de datos:** al igual que el RunInfo de SRA, el archivo se incluye
+> junto a este documento. Si no está en local, el código lo descarga desde el
+> repositorio público de IBDMDB (servidor Globus) y lo guarda en disco.
+
+**Columnas clave utilizadas:**
+
+| Columna | Descripción |
+|---------|-------------|
+| `Project` | Identificador de laboratorio del sample (G-code, ej. `G80036`); **clave de unión** con `SampleName` del RunInfo de SRA |
+| `Participant ID` | Código del participante (ej. M2025, C3016) |
+| `data_type` | Tipo de dato (`metagenomics`, `transcriptomics`, etc.) |
+| `diagnosis` | Diagnóstico: `CD`, `UC` o `nonIBD` |
+| `consent_age` | Edad del participante en el momento de consentimiento |
+| `sex` | `Female` / `Male` |
+| `site_name` | Hospital de reclutamiento |
+| `hbi` | Harvey–Bradshaw Index en esa visita (≥5 = activo) |
+| `visit_num` | Número de visita del estudio |
+| `baseline_montreal_location` | Localización anatómica de Montreal (solo CD) |
+
+```{r carga_meta}
+LOCAL_META <- "hmp2_metadata_2018-08-20.csv"
+
+if (!file.exists(LOCAL_META)) {
+  download.file(
+    "https://g-227ca.190ebd.75bc.data.globus.org/ibdmdb/metadata/hmp2_metadata_2018-08-20.csv",
+    destfile = LOCAL_META, mode = "wb"
+  )
+}
+
+meta <- read_csv(LOCAL_META, show_col_types = FALSE)
+cat("Filas:", nrow(meta), "| Columnas:", ncol(meta), "\n\n")
+
+meta_mgx <- meta |>
+  filter(data_type == "metagenomics", !is.na(Project), Project != "")
+
+cat("Filas metagenómica:", nrow(meta_mgx), "\n")
+cat("\nDistribución de diagnósticos (metagenómica):\n")
+print(table(meta_mgx$diagnosis))
+```
+
+# Cruce de tablas SRA × IBDMDB
+
+El campo `SampleName` del RunInfo de SRA y el campo `Project` de los metadatos
+del IBDMDB contienen el mismo identificador de laboratorio (G-code, ej. `G80036`).
+Este es el campo de unión directo; no se requieren llamadas adicionales a la API
+de NCBI ni de BioSample.
+
+> **Nota metodológica:** en implementaciones alternativas (ej. Python/Jupyter)
+> se obtiene el `Participant ID` consultando la API de BioSample de NCBI para
+> extraer el atributo `host_subject_id` (ej. `M2028C1_MGX`) y parsearlo. Aquí
+> ese paso es innecesario porque el G-code (`Project`) actúa directamente como
+> clave de unión entre ambas tablas y la fila resultante contiene ya el
+> `Participant ID` y el HBI exacto de esa colección específica.
+
+Cada run de SRA queda enriquecido con sus metadatos clínicos de la visita exacta
+en que fue recogida la muestra.
+
+```{r cruce}
+merged <- sra_mgx |>
+  inner_join(
+    meta_mgx |> select(
+      Project, `Participant ID`, diagnosis,
+      consent_age, sex, site_name,
+      hbi, visit_num, week_num,
+      baseline_montreal_location
+    ),
+    by = c("SampleName" = "Project")
+  )
+
+cat("Runs con metadata clínica asignada:", nrow(merged), "\n")
+cat("Participantes únicos:", n_distinct(merged$`Participant ID`), "\n")
+cat("\nDistribución diagnósticos en tabla cruzada:\n")
+print(table(merged$diagnosis))
+
+write_csv(merged, "all_samples_merged.csv")
+cat("\nGuardado: all_samples_merged.csv (", nrow(merged), "filas ×", ncol(merged), "columnas)\n")
+```
+
+# Criterios de selección
+
+Para un estudio piloto con **n = 4 por grupo** (2 mujeres + 2 hombres) se
+aplican los siguientes filtros:
+
+| Criterio | CD | nonIBD |
+|---|---|---|
+| Diagnóstico | `CD` | `nonIBD` (se excluye UC) |
+| Edad | 20–60 años | 20–60 años |
+| Actividad clínica | HBI ≥ 5 en esa visita | No aplica |
+| Sexo | 2 mujeres + 2 hombres | 2 mujeres + 2 hombres |
+| Visita seleccionada | HBI más alto; desempate por primera visita | Visita 1 (baseline) |
+| Tamaño mínimo | > 500 MB | > 500 MB |
+| Un run por participante | Sí | Sí |
+
+> **Harvey–Bradshaw Index (HBI):** escala clínica validada para cuantificar la
+> actividad de la Enfermedad de Crohn. Evalúa cinco parámetros: bienestar
+> general (0–4), dolor abdominal (0–3), número de deposiciones líquidas diarias,
+> masa abdominal palpable (0–3) y complicaciones extraintestinales. Una
+> puntuación **< 5 indica remisión**, **5–7 actividad leve**,
+> **8–16 actividad moderada-grave** y **> 16 actividad muy grave**.
+
+> **¿Por qué seleccionar la visita con el HBI más alto?** Lloyd-Price et al.
+> (2019) advierten que ninguna especie metagenómica mostró diferencias
+> significativas entre IBD y no-IBD tras corrección por pruebas múltiples, y
+> atribuyen este resultado a que muchos pacientes estaban en remisión en el
+> momento del muestreo: solo el 24,3 % de las muestras CD mostraron disbiosis.
+> Seleccionar la visita con mayor HBI garantiza que la muestra corresponde a un
+> episodio de actividad documentada, maximizando la señal de disbiosis esperada
+> (depleción de *Faecalibacterium prausnitzii* y *Roseburia hominis*;
+> enriquecimiento de *Escherichia coli* y *Ruminococcus torques*).
+
+> **¿Por qué n = 4 con paridad de sexo?** El sexo es uno de los principales
+> confundidores del microbioma intestinal. Entre los participantes CD adultos
+> (20–60 años) con HBI ≥ 5 en alguna colección depositada en SRA solo hay 2
+> hombres disponibles, lo que impone un máximo de n = 4 con diseño equilibrado
+> (2F + 2M). El grupo nonIBD cuenta con exactamente 2 mujeres adultas en SRA,
+> lo que permite el mismo equilibrio. Se eliminó el límite superior de tamaño
+> de archivo (originalmente 2,5 GB) para no excluir a la única segunda mujer
+> nonIBD disponible (~3,8 GB); la mayor profundidad se normaliza mediante
+> rarefacción en el análisis de diversidad.
+
+> **¿Por qué excluir menores de 20 años?** Con solo n = 4 por grupo, incluir
+> edades pediátricas introduciría un confundidor crítico: la composición del
+> microbioma intestinal es radicalmente distinta en menores e independiente del
+> diagnóstico, lo que impediría cualquier interpretación basada en el fenotipo
+> de enfermedad.
+
+```{r candidatos}
+candidatos <- merged |>
+  filter(
+    diagnosis %in% c("CD", "nonIBD"),
+    consent_age >= 20,
+    consent_age <= 60,
+    size_MB >= 500,
+    !is.na(`Participant ID`)
+  )
+
+# CD: por participante, la visita con HBI más alto; desempate por visit_num menor
+cd_pool <- candidatos |>
+  filter(diagnosis == "CD", !is.na(hbi), hbi >= 5) |>
+  arrange(desc(hbi), visit_num) |>
+  distinct(`Participant ID`, .keep_all = TRUE)
+
+# nonIBD: por participante, la primera visita disponible (baseline)
+ctrl_pool <- candidatos |>
+  filter(diagnosis == "nonIBD") |>
+  arrange(visit_num, consent_age) |>
+  distinct(`Participant ID`, .keep_all = TRUE)
+
+cols_cd   <- c("Run","Participant ID","diagnosis","consent_age","sex","visit_num","hbi","size_MB")
+cols_ctrl <- c("Run","Participant ID","diagnosis","consent_age","sex","visit_num","size_MB")
+
+cat("Candidatos CD (HBI ≥ 5):", nrow(cd_pool), "\n")
+cat("Candidatos nonIBD:       ", nrow(ctrl_pool), "\n\n")
+
+cat("— CD (ordenado por HBI desc, desempate visit_num asc) —\n")
+print(cd_pool |> select(all_of(intersect(cols_cd, colnames(cd_pool)))))
+
+cat("\n— nonIBD (primera visita por participante) —\n")
+print(ctrl_pool |> select(all_of(intersect(cols_ctrl, colnames(ctrl_pool)))))
+```
+
+# Selección final: 4 CD + 4 nonIBD
+
+Se eligen **4 CD** y **4 nonIBD** con paridad de sexo (2 mujeres + 2 hombres
+por grupo):
+
+- **CD mujeres:** las 2 participantes femeninas cuya colección en SRA tiene el
+  HBI más alto (mayor actividad clínica documentada).
+- **CD hombres:** los 2 participantes masculinos cuya colección en SRA tiene el
+  HBI más alto.
+- **nonIBD mujeres:** las 2 únicas mujeres nonIBD adultas disponibles en SRA
+  con muestra en la visita baseline (C1).
+- **nonIBD hombres:** los 2 hombres nonIBD adultos más jóvenes con visita
+  baseline (C1).
+
+```{r seleccion}
+cd_f   <- cd_pool   |> filter(sex == "Female") |> head(2)
+cd_m   <- cd_pool   |> filter(sex == "Male")   |> head(2)
+ctrl_f <- ctrl_pool |> filter(sex == "Female") |> head(2)
+ctrl_m <- ctrl_pool |> filter(sex == "Male")   |> head(2)
+
+selected <- bind_rows(cd_f, cd_m, ctrl_f, ctrl_m)
+
+cols_final <- c("Run","SampleName","Participant ID","diagnosis",
+                "consent_age","sex","visit_num","hbi","size_MB",
+                "site_name","baseline_montreal_location")
+
+selected <- selected |>
+  select(all_of(intersect(cols_final, colnames(selected))))
+
+cat("Muestras seleccionadas:", nrow(selected), "\n\n")
+print(selected)
+```
+
+# Resumen demográfico por grupo
+
+Antes de pasar a la descarga conviene verificar que los dos grupos son
+comparables en edad y que la distribución de sexo queda documentada. Se
+incluye también el espacio total estimado en disco para valorar la viabilidad
+con las cuotas de Galaxy.
+
+```{r resumen}
+resumen <- selected |>
+  group_by(diagnosis) |>
+  summarise(
+    n          = n(),
+    edad_media = round(mean(consent_age, na.rm = TRUE), 1),
+    edad_min   = min(consent_age, na.rm = TRUE),
+    edad_max   = max(consent_age, na.rm = TRUE),
+    mujeres    = sum(sex == "Female", na.rm = TRUE),
+    hombres    = sum(sex == "Male",   na.rm = TRUE),
+    hbi_medio  = round(mean(hbi, na.rm = TRUE), 1),
+    total_GB   = round(sum(size_MB, na.rm = TRUE) / 1024, 2),
+    .groups = "drop"
+  )
+
+print(resumen)
+cat("\nEspacio total estimado:",
+    round(sum(selected$size_MB, na.rm = TRUE) / 1024, 1), "GB\n")
+```
+
+# Guardado de resultados
+
+```{r guardar}
+write_csv(selected, "selected_samples_summary.csv")
+cat("Guardado: selected_samples_summary.csv\n")
+cat("Filas:", nrow(selected), "| Columnas:", ncol(selected), "\n")
+```
+
+# Limitaciones del diseño de muestreo
+
+1. **Potencia estadística reducida (n = 4).** Con cuatro muestras por grupo los
+   resultados son puramente exploratorios.
+
+2. **Actividad clínica moderada.** El HBI máximo de las colecciones depositadas
+   en SRA es 6 (actividad leve). Colecciones con mayor actividad documentada en
+   IBDMDB no están disponibles en el depósito público PRJNA389280.
+
+3. **Heterogeneidad de localización Montreal.** Los pacientes CD presentan distinta
+   localización anatómica (L1, L2, L3), lo que puede aumentar la varianza
+   intragrupo.
+
+4. **Sesgo de sitio clínico.** Muestras CD de dos hospitales (Cedars-Sinai y MGH);
+   todas las nonIBD de un único centro (MGH).
+
+5. **Profundidad de secuenciación heterogénea.** Tamaños entre ~1 GB y ~3,8 GB;
+   se normalizará mediante rarefacción en el análisis de diversidad.
+
+6. **Comparabilidad parcial entre módulos.** El Módulo A analiza biopsias de mucosa
+   ileal; el Módulo B analiza microbioma fecal. Se evaluó restringir a localización
+   Montreal L1, pero solo 1 de 5 participantes L1 disponibles tenía HBI ≥ 5 en
+   SRA. Se priorizó la actividad clínica sobre la homogeneidad anatómica.
+
+# Accesiones para descarga en Galaxy
+
+Las 8 accesiones SRR se descargarán en [usegalaxy.org](https://usegalaxy.org)
+y se organizarán como una **colección de pares** (*List of Dataset Pairs*), de
+modo que cada herramienta del pipeline procese las 8 muestras en un único paso
+en lugar de 8 trabajos independientes.
+
+## Listado de accesiones
+
+Las 8 accesiones SRR seleccionadas son:
+
+```{r accesiones}
+selected |> select(Run, `Participant ID`, diagnosis, consent_age, sex, hbi, size_MB)
+```
+
+# Entorno de ejecución (reproducibilidad)
+
+```{r session_info}
+sessionInfo()
+```

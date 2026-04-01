@@ -1,0 +1,1044 @@
+---
+title: "Módulo B — Análisis metagenómico del microbioma intestinal"
+subtitle: "CD vs nonIBD · PRJNA389280 · IBDMDB/HMP2"
+author: "Laura Llamas López · María Sánchez Vivo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+    df_print: kable
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", dpi = 150
+)
+dir.create("figuras", showWarnings = FALSE)
+FIG <- function(name) file.path("figuras", name)
+```
+
+# Introducción
+
+Este documento presenta el análisis *downstream* de **8 muestras** de
+metagenómica *shotgun* (4 CD + 4 nonIBD) del proyecto IBDMDB/HMP2
+[1], procesadas en Galaxy Europe
+mediante el pipeline fastp → Bowtie2 (descontaminación humana) → Kraken2 →
+Bracken. Los datos de partida son los **Bracken Reports** a nivel de especie
+y los **Kraken-style Reports** (para la jerarquía taxonómica completa).
+
+El análisis se estructura en las siguientes secciones:
+
+1. Carga de datos y preprocesamiento (incluyendo mapeo taxonómico)
+2. Composición taxonómica (filo, especie)
+3. Diversidad alfa
+4. Diversidad beta (PCoA, PERMANOVA, índice de disbiosis)
+5. Especies clave en EC según Lloyd-Price et al. [1]
+6. Resumen e interpretación
+
+> **Nota sobre tamaño muestral:** Con n = 4 por grupo y actividad clínica
+> leve (HBI = 5–6), los resultados son exploratorios y generadores de
+> hipótesis. Las tendencias observadas se interpretan a la luz de los
+> hallazgos del artículo original (n = 132).
+
+# Librerías
+
+```{r librerias}
+library(phyloseq)    # Estructura de datos para metagenómica (OTU table, sample data, taxonomía)
+library(vegan)       # Ecología: diversidad alfa/beta, PERMANOVA, rarefacción
+library(ggplot2)     # Sistema de visualización gráfica
+library(dplyr)       # Manipulación de data frames (filter, mutate, summarise, join)
+library(readr)       # Lectura eficiente de ficheros tabulares (read_tsv, read_csv)
+library(tidyr)       # Transformación de datos entre formato ancho y largo
+library(tibble)      # Versión moderna de data.frame; rownames_to_column / column_to_rownames
+library(pheatmap)    # Mapas de calor con clustering jerárquico y anotaciones
+library(ggrepel)     # Etiquetas de texto no solapadas en gráficas ggplot2
+library(kableExtra)  # Formato enriquecido de tablas HTML en documentos RMarkdown
+library(scales)      # Funciones auxiliares de escalas para ggplot2 (hue_pal, etc.)
+
+theme_set(theme_bw(base_size = 13))
+theme_update(plot.title = element_text(hjust = 0.5),
+             plot.subtitle = element_text(hjust = 0.5))
+
+# Paleta de colores 
+color_dx <- c("nonIBD" = "#377EB8", "CD" = "#984EA3")
+# Versión oscura para bordes / puntos
+color_dx_dark <- c("nonIBD" = "#1F4E79", "CD" = "#5B2C6F")
+
+# Helper: tabla HTML
+ktbl <- function(df, caption = NULL, ...) {
+  kable(df, caption = caption, escape = FALSE, format = "html", ...) |>
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+      full_width = FALSE, position = "left"
+    )
+}
+```
+
+# Carga de datos y preprocesamiento {#carga}
+
+## Lectura de los 8 Bracken Reports
+
+> **Requisito:** Para que este bloque funcione correctamente, las carpetas
+> `bracken_reports/` y `bracken_kraken_style_report/`, y el fichero
+> `selected_samples_summary.csv` deben estar en el **mismo directorio que este fichero `.Rmd`**.
+
+```{r carga_bracken}
+bracken_dir <- "./bracken_reports"
+files <- list.files(bracken_dir, pattern = "\\.tabular$", full.names = TRUE)
+sample_ids <- gsub("\\.tabular$", "", basename(files))
+names(files) <- sample_ids
+
+bracken_list <- lapply(files, function(f) {
+  read_tsv(f, show_col_types = FALSE) |>
+    filter(taxonomy_lvl == "S") |>
+    select(name, taxonomy_id, new_est_reads, fraction_total_reads)
+})
+
+# Matriz de conteos (especies × muestras)
+abundance_long <- bind_rows(bracken_list, .id = "sample") |>
+  select(sample, name, new_est_reads)
+
+otu_wide <- abundance_long |>
+  pivot_wider(names_from = sample, values_from = new_est_reads, values_fill = 0) |>
+  column_to_rownames("name")
+
+cat("Matriz de abundancias:", nrow(otu_wide), "especies ×", ncol(otu_wide), "muestras\n")
+```
+
+## Mapeo taxonómico especie → filo (desde Kraken-style Reports) {#mapeo-taxon}
+
+En lugar de asignar filos manualmente por nombre de género, empleamos los
+**Kraken-style Reports** generados por Bracken, que conservan la jerarquía
+taxonómica completa de NCBI. Para cada reporte, recorremos la jerarquía
+y asignamos a cada especie (rango S) el filo (rango P) ancestral más
+cercano.
+
+```{r mapeo_taxonomico}
+kraken_dir <- "./bracken_kraken_style_report"
+kraken_files <- list.files(kraken_dir, pattern = "\\.tabular$", full.names = TRUE)
+
+# Función: parsear un Kraken-style report y devolver data.frame species → phylum
+parse_kraken_hierarchy <- function(filepath) {
+  lines <- readLines(filepath)
+  current_phylum <- "Sin asignar"
+  results <- list()
+
+  for (line in lines) {
+    parts <- strsplit(line, "\t")[[1]]
+    if (length(parts) < 6) next
+    rank  <- trimws(parts[4])
+    name  <- trimws(parts[6])
+
+    if (rank == "P")  current_phylum <- name
+    if (rank == "S")  results[[length(results) + 1]] <- data.frame(
+      species = name, phylum = current_phylum, stringsAsFactors = FALSE
+    )
+  }
+  bind_rows(results)
+}
+
+# Combinar mapeo de todos los reportes (unión)
+tax_map <- lapply(kraken_files, parse_kraken_hierarchy) |>
+  bind_rows() |>
+  distinct(species, .keep_all = TRUE)
+
+cat("Especies con filo asignado:", nrow(tax_map), "\n")
+head(tax_map, 10) |> ktbl(caption = "Ejemplo de mapeo especie → filo")
+```
+
+## Sinónimos taxonómicos {#sinonimos}
+
+La base de datos de Kraken2 emplea la taxonomía actual de NCBI (2024), que
+incluye numerosos cambios nomenclaturales respecto a la literatura clásica
+del microbioma intestinal. Los nombres han sido validados por el IJSEM a
+través de sus *Validation Lists* (*Int J Syst Evol Microbiol*), que
+constituyen la publicación oficial de nuevos nombres y combinaciones según
+el Código Internacional de Nomenclatura de Procariotas (ICNP). A
+continuación se documentan los sinónimos relevantes para este estudio,
+particularmente aquellos que aparecen en Lloyd-Price et al. [1] bajo nombres
+anteriores.
+
+```{r sinonimos}
+# Tabla de sinónimos: nombre actual en NCBI → nombre en la literatura / Lloyd-Price et al.
+synonyms <- tribble(
+  ~current_name,                    ~old_name,                     ~notes,
+  "Segatella copri",                "Prevotella copri",            "Nuevo género",
+  "Phocaeicola vulgatus",           "Bacteroides vulgatus",        "Reclasificado a Phocaeicola",
+  "Phocaeicola dorei",              "Bacteroides dorei",           "Idem",
+  "Phocaeicola coprophilus",        "Bacteroides coprophilus",     "Idem",
+  "Agathobacter rectalis",          "Eubacterium rectale",         "Nuevo género",
+  "Blautia_coccoides group",        "Ruminococcus obeum",          "Reclasificado a Blautia",
+  "Mediterraneibacter gnavus",      "Ruminococcus gnavus",         "Nuevo género",
+  "Mediterraneibacter torques",     "Ruminococcus torques",        "Idem"
+)
+
+synonyms |>
+  rename(`Nombre actual (NCBI 2024)` = current_name,
+         `Nombre en Lloyd-Price et al.` = old_name,
+         Observación = notes) |>
+  ktbl(caption = "Sinónimos taxonómicos relevantes para este estudio")
+
+# Crear función para mostrar nombre con sinónimo cuando aplique
+display_name <- function(species) {
+  species <- as.character(species)
+  idx <- match(species, synonyms$current_name)
+  ifelse(!is.na(idx),
+         paste0(species, " (= ", synonyms$old_name[idx], ")"),
+         species)
+}
+```
+
+## Metadatos y objeto phyloseq
+
+```{r metadatos}
+sample_meta <- read_csv("./selected_samples_summary.csv", show_col_types = FALSE) |>  # CSV en el mismo directorio que el .Rmd
+  mutate(
+    diagnosis = factor(diagnosis, levels = c("nonIBD", "CD")),
+    sex = factor(sex),
+    label = paste0(`Participant ID`, "\n(", diagnosis, ")")
+  ) |>
+  column_to_rownames("Run")
+
+stopifnot(all(colnames(otu_wide) %in% rownames(sample_meta)))
+sample_meta <- sample_meta[colnames(otu_wide), ]
+
+sample_meta |>
+  rownames_to_column("Run") |>
+  select(Run, `Participant ID`, diagnosis, consent_age, sex, visit_num, hbi, site_name) |>
+  rename(Participante = `Participant ID`, Diagnóstico = diagnosis,
+         Edad = consent_age, Sexo = sex, Visita = visit_num,
+         HBI = hbi, Centro = site_name) |>
+  ktbl(caption = "Metadatos de las 8 muestras seleccionadas")
+```
+
+```{r phyloseq_build}
+# Eliminar reads residuales de Homo sapiens
+homo_rows <- grep("Homo sapiens", rownames(otu_wide), ignore.case = TRUE)
+if (length(homo_rows) > 0) {
+  cat("Eliminando", length(homo_rows), "entrada(s) de Homo sapiens:",
+      sum(otu_wide[homo_rows, ]), "reads totales\n")
+  otu_wide <- otu_wide[-homo_rows, ]
+}
+
+OTU <- otu_table(as.matrix(otu_wide), taxa_are_rows = TRUE)
+SAM <- sample_data(sample_meta)
+ps  <- phyloseq(OTU, SAM)
+cat("Objeto phyloseq:", ntaxa(ps), "especies ×", nsamples(ps), "muestras\n")
+```
+
+## Profundidad de secuenciación
+
+```{r reads_por_muestra, fig.height=4, fig.width=8}
+reads_df <- colSums(otu_table(ps)) |>
+  enframe(name = "sample", value = "total_reads") |>
+  left_join(sample_meta |> rownames_to_column("sample") |>
+              select(sample, diagnosis, `Participant ID`), by = "sample")
+
+p_profundidad <- ggplot(reads_df, aes(x = reorder(`Participant ID`, -total_reads),
+                     y = total_reads / 1e6, fill = diagnosis)) +
+  geom_col(width = 0.7, color = "grey30", linewidth = 0.3) +
+  scale_fill_manual(values = color_dx) +
+  labs(x = NULL, y = "Millones de lecturas clasificadas (Bracken)",
+       title = "Profundidad de secuenciación por muestra",
+       fill = "Diagnóstico") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_profundidad
+ggsave(FIG("01_profundidad_secuenciacion.png"), p_profundidad, width = 8, height = 4, dpi = 300)
+```
+
+La profundidad de secuenciación es heterogénea, con un rango de 7 a 21 millones
+de lecturas clasificadas por Bracken. Las dos muestras con mayor profundidad
+corresponden al grupo nonIBD (M2077 y M2039), aunque no se observa un patrón
+sistemático asociado al diagnóstico: la variabilidad refleja principalmente
+diferencias en el tamaño de los archivos FASTQ originales (995–3832 MB).
+Esta heterogeneidad se corrige en los análisis posteriores mediante normalización a abundancias relativas. Las curvas de rarefacción que se muestran a continuación permiten evaluar si la profundidad de cada muestra es suficiente para capturar su diversidad.
+
+## Curvas de rarefacción
+
+Una curva de rarefacción representa el número de especies observadas en función del número de lecturas procesadas. Cuando la curva alcanza una meseta, indica que aumentar la profundidad de secuenciación no añadiría especies nuevas, es decir, que el esfuerzo de muestreo es suficiente para capturar la diversidad de esa comunidad.
+
+```{r rarefaccion, fig.height=5, fig.width=8}
+otu_mat_rare <- as.data.frame(t(as.matrix(otu_table(ps))))
+rare_data <- rarecurve(otu_mat_rare, step = 5000, tidy = TRUE)
+colnames(rare_data) <- c("Sample", "reads", "species")
+
+rare_data <- rare_data |>
+  left_join(
+    sample_meta |> rownames_to_column("Sample") |>
+      select(Sample, diagnosis, `Participant ID`),
+    by = "Sample"
+  )
+
+p_rarefaccion <- ggplot(rare_data, aes(x = reads, y = species, color = diagnosis, group = Sample)) +
+  geom_line(linewidth = 0.8) +
+  geom_text_repel(
+    data = rare_data |> group_by(Sample) |> slice_max(reads, n = 1),
+    aes(label = `Participant ID`), size = 3, nudge_x = 50000
+  ) +
+  scale_color_manual(values = color_dx) +
+  labs(x = "Número de lecturas", y = "Especies observadas",
+       title = "Curvas de rarefacción",
+       subtitle = "La saturación indica profundidad suficiente para capturar la diversidad",
+       color = "Diagnóstico")
+p_rarefaccion
+ggsave(FIG("02_curvas_rarefaccion.png"), p_rarefaccion, width = 8, height = 5, dpi = 300)
+```
+
+Todas las curvas alcanzan una meseta clara antes de agotar las lecturas disponibles, lo que confirma que la profundidad de secuenciación es suficiente en todas las muestras para capturar su diversidad a nivel de especie. El rango de riqueza asintótica es amplio (entre ~350 y ~1013 especies observadas): M2077 (nonIBD) es la muestra más rica (~1013 sp.), seguida de M2025 (CD, ~840 sp.), mientras que C3016 y C3017 (ambas CD) presentan las riquezas más bajas (~350–380 sp.). Esta variación entre individuos del mismo grupo es notable y anticipa la alta variabilidad interindividual que se observará en los análisis de diversidad.
+
+La heterogeneidad en profundidad de secuenciación (7–21 M lecturas) no introduce sesgo en la comparación de riqueza: incluso la muestra con menos lecturas (M2042, ~7 M) ha alcanzado la meseta de saturación. Esto valida el uso de riqueza observada directa sin rarefacción para los análisis de diversidad alfa de este conjunto de datos.
+
+# Composición taxonómica
+
+## Composición a nivel de filo
+
+```{r composicion_filo, fig.height=5, fig.width=9}
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+
+# Añadir filo desde el mapeo taxonómico
+rel_df <- psmelt(ps_rel) |>
+  rename(species = OTU, rel_abundance = Abundance) |>
+  left_join(tax_map, by = "species") |>
+  mutate(phylum = ifelse(is.na(phylum), "Sin asignar", phylum))
+
+# Agrupar filos con < 1% de abundancia media como "Otros"
+# Primero sumamos por filo dentro de cada muestra, luego promediamos entre muestras
+phylum_means <- rel_df |>
+  group_by(Sample, phylum) |>
+  summarise(sample_abd = sum(rel_abundance), .groups = "drop") |>
+  group_by(phylum) |>
+  summarise(mean_abd = mean(sample_abd), .groups = "drop")
+
+minor_phyla <- phylum_means$phylum[phylum_means$mean_abd < 0.005]
+rel_df <- rel_df |>
+  mutate(phylum_plot = ifelse(phylum %in% minor_phyla, "Otros", phylum))
+
+# Colores fijos para los filos principales + Otros
+phylum_colors_fixed <- c(
+  "Bacteroidota"          = "#1F78B4",
+  "Bacillota"             = "#E31A1C",
+  "Pseudomonadota"        = "#33A02C",
+  "Actinomycetota"        = "#FF7F00",
+  "Verrucomicrobiota"     = "#6A3D9A",
+  "Thermodesulfobacteriota" = "#B15928",
+  "Uroviricota"           = "#FB9A99",
+  "Spirochaetota"         = "#CAB2D6",
+  "Fusobacteriota"        = "#FDBF6F",
+  "Otros"                 = "grey75",
+  "Sin asignar"           = "grey50"
+)
+
+# Asegurar que todos los filos presentes tienen color asignado
+all_phyla_in_data <- unique(rel_df$phylum_plot)
+missing_phyla <- setdiff(all_phyla_in_data, names(phylum_colors_fixed))
+if (length(missing_phyla) > 0) {
+  extra_cols <- setNames(
+    scales::hue_pal()(length(missing_phyla)),
+    missing_phyla
+  )
+  phylum_colors_fixed <- c(phylum_colors_fixed, extra_cols)
+}
+
+# Labels con Participant ID
+sample_labels <- sample_meta |>
+  rownames_to_column("Sample") |>
+  select(Sample, `Participant ID`, diagnosis) |>
+  mutate(label = paste0(`Participant ID`, "\n(", diagnosis, ")"))
+
+phylum_per_sample <- rel_df |>
+  group_by(Sample, diagnosis, phylum_plot) |>
+  summarise(abd = sum(rel_abundance), .groups = "drop") |>
+  left_join(sample_labels, by = c("Sample", "diagnosis"))
+
+# Orden: nonIBD primero, luego CD; dentro de cada grupo por abundancia de Bacteroidota desc.
+bacteroidota_order <- phylum_per_sample |>
+  filter(phylum_plot == "Bacteroidota") |>
+  select(Sample, diagnosis, abd) |>
+  arrange(diagnosis, desc(abd)) |>
+  left_join(sample_labels, by = c("Sample", "diagnosis")) |>
+  pull(label)
+
+phylum_per_sample <- phylum_per_sample |>
+  mutate(label = factor(label, levels = bacteroidota_order))
+
+p_comp_filo <- ggplot(phylum_per_sample,
+       aes(x = label, y = abd, fill = phylum_plot)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = phylum_colors_fixed, name = "Filo") +
+  labs(x = NULL, y = "Abundancia relativa",
+       title = "Composición taxonómica a nivel de filo") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0, 1))
+p_comp_filo
+ggsave(FIG("03_composicion_filo.png"), p_comp_filo, width = 9, height = 5, dpi = 300)
+```
+
+Todas las muestras están dominadas por **Bacteroidota** y **Bacillota**
+(antes Firmicutes), los dos filos principales del microbioma intestinal
+humano, en concordancia con lo descrito en la literatura [1,2]. Las muestras
+nonIBD presentan en general una mayor proporción de Bacteroidota, mientras
+que en las muestras CD se observa mayor variabilidad en el ratio
+Bacteroidota/Bacillota. Destaca la muestra M2039 (nonIBD), que muestra una
+proporción elevada de **Uroviricota** (~10%), correspondiente a bacteriófagos
+clasificados por Kraken2, un hallazgo puntual que no se repite en el resto
+de muestras y que puede reflejar un episodio de inducción de profagos en esa
+muestra concreta. La presencia residual de **Pseudomonadota** en varias
+muestras es consistente con su papel minoritario pero relevante en la disbiosis
+asociada a la EC.
+
+## Composición a nivel de género
+
+```{r composicion_genero, fig.height=5, fig.width=9}
+rel_df <- rel_df |>
+  mutate(genus = sub(" .*", "", species))
+
+genus_per_sample <- rel_df |>
+  group_by(Sample, diagnosis, genus) |>
+  summarise(abd = sum(rel_abundance), .groups = "drop")
+
+top_genera <- genus_per_sample |>
+  group_by(genus) |>
+  summarise(mean_abd = mean(abd), .groups = "drop") |>
+  slice_max(mean_abd, n = 15) |>
+  pull(genus)
+
+genus_per_sample <- genus_per_sample |>
+  mutate(genus_plot = ifelse(genus %in% top_genera, genus, "Otros")) |>
+  group_by(Sample, diagnosis, genus_plot) |>
+  summarise(abd = sum(abd), .groups = "drop") |>
+  left_join(sample_labels, by = c("Sample", "diagnosis"))
+
+genus_per_sample <- genus_per_sample |>
+  mutate(label = factor(label, levels = bacteroidota_order))
+
+p_comp_generos <- ggplot(genus_per_sample,
+       aes(x = label, y = abd, fill = genus_plot)) +
+  geom_col(width = 0.8) +
+  labs(x = NULL, y = "Abundancia relativa",
+       title = "Composición taxonómica a nivel de género",
+       fill = "Género") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(face = "italic", size = 8)) +
+  coord_cartesian(ylim = c(0, 1))
+p_comp_generos
+ggsave(FIG("04_composicion_generos_por_muestra.png"), p_comp_generos, width = 9, height = 5, dpi = 300)
+```
+
+La figura refleja una elevada variabilidad inter-individual en la composición a nivel de género, un patrón habitual en estudios de microbioma intestinal [1]. *Bacteroides* (naranja) es el género más frecuentemente dominante, especialmente en las muestras de CD (C3016, C3017, M2027), donde llega a representar 50-70% de la comunidad. *Phocaeicola* (azul) tiene un peso notable en varios controles sanos (M2039, M2077, M2079), reflejando la abundancia de *P. vulgatus* ya observada a nivel de especie.
+
+Destaca M2042 (nonIBD), dominada en ~60% por *Segatella*, y M2025 (CD), con una proporción también elevada de este género. *Segatella copri* (= *Prevotella copri*) es la especie característica del denominado "enterotipo Prevotella", uno de los principales patrones de organización del microbioma intestinal humano, asociado típicamente a dietas ricas en fibra vegetal y carbohidratos complejos. Su alta abundancia en M2042, un control sano, es biológicamente coherente con este enterotipo. Sin embargo, su presencia igualmente prominente en M2025 (CD) pone de manifiesto que el enterotipo Prevotella puede mantenerse incluso en presencia de enfermedad inflamatoria intestinal, lo que complica la interpretación del estado disbiótico. De hecho, la relación entre *S. copri* e IBD es ambigua en la literatura: aunque algunos trabajos la asocian a inflamación sistémica, su abundancia en contextos de CD no está sistemáticamente elevada ni reducida. La coexistencia de este enterotipo en un individuo sano y uno con CD ilustra que las diferencias de composición entre grupos pueden estar enmascaradas por la heterogeneidad individual, un efecto que se amplifica con tamaños muestrales pequeños como el de este análisis. La presencia de *Carjivirus* en M2039 es coherente con la fracción de Uroviricota (~10%) detectada en esa muestra a nivel de filo, e indica una carga de bacteriófagos inusualmente alta. El resto de géneros (*Alistipes*, *Faecalibacterium*, *Parabacteroides*) aparecen en proporciones menores y variables entre muestras, sin un patrón diagnóstico claro dado el tamaño muestral.
+
+## Especies más abundantes por diagnóstico {#fig-species-bars}
+
+La siguiente figura reproduce el formato de la **Figura 2B** de Lloyd-Price et al. [1], mostrando la abundancia relativa media de las 15 especies
+más abundantes, agrupadas por diagnóstico. Los nombres entre paréntesis
+indican sinónimos recientes por cambios en la nomenclatura de NCBI.
+
+```{r species_barplot_lloydprice, fig.height=7, fig.width=9}
+# Media de abundancia relativa por especie y diagnóstico
+species_by_dx <- rel_df |>
+  group_by(species, diagnosis) |>
+  summarise(mean_abd = mean(rel_abundance), .groups = "drop")
+
+# Top 15 especies por abundancia media global
+top15 <- rel_df |>
+  group_by(species) |>
+  summarise(global_mean = mean(rel_abundance), .groups = "drop") |>
+  slice_max(global_mean, n = 15) |>
+  pull(species)
+
+species_top <- species_by_dx |>
+  filter(species %in% top15) |>
+  mutate(
+    display = display_name(species),
+    display = factor(display, levels = rev(unique(display[order(
+      sapply(display, function(d) {
+        sp <- top15[sapply(top15, function(s) grepl(s, d, fixed = TRUE))]
+        if (length(sp) > 0) {
+          max(species_by_dx$mean_abd[species_by_dx$species == sp[1]])
+        } else 0
+      })
+    )])))
+  )
+
+# Ordenar por abundancia global descendente
+order_sp <- rel_df |>
+  filter(species %in% top15) |>
+  group_by(species) |>
+  summarise(global_mean = mean(rel_abundance), .groups = "drop") |>
+  arrange(global_mean) |>
+  pull(species)
+
+species_top <- species_by_dx |>
+  filter(species %in% top15) |>
+  mutate(
+    display = display_name(species),
+    species = factor(species, levels = order_sp),
+    display = factor(display, levels = display_name(order_sp))
+  )
+
+p_top15_especies <- ggplot(species_top, aes(x = mean_abd, y = display, fill = diagnosis)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6,
+           color = "grey30", linewidth = 0.2) +
+  scale_fill_manual(values = color_dx, name = "Diagnóstico") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Abundancia relativa media",
+       y = NULL,
+       title = "Top 15 especies por abundancia relativa media") +
+  theme(axis.text.y = element_text(face = "italic", size = 9),
+        legend.position = "top")
+p_top15_especies
+ggsave(FIG("05_top15_especies_abundancia_media.png"), p_top15_especies, width = 9, height = 7, dpi = 300)
+```
+
+```{r tabla_top15}
+# Tabla numérica complementaria
+species_top |>
+  select(species, diagnosis, mean_abd) |>
+  mutate(mean_abd = round(mean_abd * 100, 2)) |>
+  pivot_wider(names_from = diagnosis, values_from = mean_abd) |>
+  arrange(desc(pmax(nonIBD, CD, na.rm = TRUE))) |>
+  mutate(species = paste0("<em>", display_name(as.character(species)), "</em>")) |>
+  rename(Especie = species, `nonIBD (%)` = nonIBD, `CD (%)` = CD) |>
+  ktbl(caption = "Abundancia relativa media (%) de las 15 especies más abundantes")
+```
+
+La especie más abundante en ambos grupos es *Phocaeicola vulgatus* (= *Bacteroides vulgatus*), con aproximadamente un 24% en nonIBD y un 19% en CD, seguida de *Segatella copri* (= *Prevotella copri*), con abundancias similares entre grupos (~14% y ~13%). Esta dominancia de bacteroidáceas en el microbioma intestinal es coherente con los patrones descritos a nivel poblacional [1].
+
+Destaca especialmente *Bacteroides cellulosilyticus*, con una abundancia marcadamente superior en controles sanos (~9.5%) frente a pacientes con CD (~1%), lo que podría reflejar la reducción de especies sacarolíticas en el contexto inflamatorio. En sentido contrario, *Bacteroides xylanisolvens* muestra mayor presencia en CD (~7.5% frente a ~4.5% en nonIBD). *Faecalibacterium prausnitzii*, productor clave de butirato y especie con propiedades antiinflamatorias demostradas [4], aparece con abundancias similares entre grupos (~4-5%), sin la reducción en CD que cabría esperar dada su asociación negativa con la inflamación intestinal. En conjunto, las diferencias entre grupos son más moderadas de lo descrito por Lloyd-Price et al. en la cohorte completa [1], lo que probablemente refleja la escasa potencia estadística derivada del reducido tamaño muestral de este análisis.
+
+# Diversidad alfa
+
+La diversidad alfa cuantifica la riqueza y equitatividad de la comunidad microbiana **dentro de cada muestra individual**. A diferencia de la diversidad beta, que compara la composición entre muestras, la diversidad alfa refleja la complejidad interna de cada comunidad. Se calcularon tres métricas complementarias:
+
+- **Riqueza observada**: número de especies (OTUs/ASVs) detectadas en cada muestra. Es la métrica más intuitiva, pero también la más sensible a la profundidad de secuenciación: muestras con más lecturas pueden acumular más especies por mayor cobertura de taxa raros. El enfoque estándar para eliminar este sesgo es la rarefacción previa (submuestrear todas las muestras al mismo número mínimo de lecturas antes de contar). En este análisis se verificó explícitamente que rarefactar al mínimo del conjunto (~7.2 M lecturas, muestra SRR5983276) no altera ningún valor de riqueza observada — cada muestra mantiene exactamente el mismo número de especies antes y después del submuestreo. Esto indica que la secuenciación es suficientemente profunda en todas las muestras para capturar las mismas especies, haciendo la comparación directa de riqueza válida sin corrección adicional. Las curvas de rarefacción de la sección de preprocesamiento confirman este resultado visualmente.
+
+- **Índice de Shannon (H')**: mide simultáneamente riqueza y equitatividad. Un valor alto indica que la comunidad contiene muchas especies distribuidas de forma relativamente uniforme; un valor bajo refleja dominancia de pocas especies. Oscila entre 0 (una sola especie) y ln(S) (S = número de especies, todas igualmente abundantes). Es moderadamente sensible a la profundidad de secuenciación, ya que las especies raras —cuya detección depende del número de lecturas— contribuyen al índice, aunque con un peso pequeño proporcional a su baja abundancia relativa.
+
+- **Índice de Simpson (1-D)**: representa la probabilidad de que dos individuos tomados al azar pertenezcan a especies distintas. Oscila entre 0 y 1; valores próximos a 1 indican alta diversidad. Es el índice más robusto frente a variaciones en la profundidad de secuenciación: al elevar las abundancias al cuadrado, las especies raras contribuyen prácticamente nada al cálculo, que queda dominado por las especies mayoritarias, las cuales están bien estimadas con independencia del número total de lecturas.
+
+Lloyd-Price et al. [1] observaron una reducción significativa de la diversidad Shannon en muestras con disbiosis activa en la cohorte IBDMDB completa.
+
+```{r diversidad_alfa}
+otu_mat <- t(as.matrix(otu_table(ps)))  # muestras × especies
+
+alpha_div <- data.frame(
+  sample   = rownames(otu_mat),
+  observed = specnumber(otu_mat),
+  shannon  = diversity(otu_mat, index = "shannon"),
+  simpson  = diversity(otu_mat, index = "simpson"),
+  stringsAsFactors = FALSE
+) |>
+  left_join(
+    sample_meta |> rownames_to_column("sample") |>
+      select(sample, diagnosis, `Participant ID`, sex, consent_age),
+    by = "sample"
+  )
+
+alpha_div |>
+  select(`Participant ID`, diagnosis, observed, shannon, simpson) |>
+  mutate(across(c(shannon, simpson), ~ round(.x, 3))) |>
+  rename(Participante = `Participant ID`, Diagnóstico = diagnosis,
+         `Riqueza obs.` = observed, Shannon = shannon, Simpson = simpson) |>
+  ktbl(caption = "Diversidad alfa por muestra")
+```
+
+## Comparación entre grupos
+
+```{r alfa_plots, fig.height=4.5, fig.width=10}
+alpha_long <- alpha_div |>
+  pivot_longer(cols = c(observed, shannon, simpson),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric,
+    levels = c("observed", "shannon", "simpson"),
+    labels = c("Riqueza observada", "Shannon (H')", "Simpson (1-D)")))
+
+p_alfa_div <- ggplot(alpha_long, aes(x = diagnosis, y = value, fill = diagnosis)) +
+  geom_boxplot(width = 0.45, alpha = 0.6, outlier.shape = NA, linewidth = 0.5) +
+  geom_jitter(aes(shape = sex), width = 0.08, size = 3.5, alpha = 0.9,
+              color = "grey20") +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = color_dx) +
+  labs(x = NULL, y = NULL,
+       title    = "Diversidad alfa: CD vs nonIBD",
+       subtitle = "Caja: mediana ± IQR; puntos: muestras individuales",
+       fill = "Diagnóstico", shape = "Sexo") +
+  theme(strip.text = element_text(face = "bold"))
+p_alfa_div
+ggsave(FIG("06_diversidad_alfa_boxplot.png"), p_alfa_div, width = 10, height = 4.5, dpi = 300)
+```
+
+## Test de Wilcoxon (exploratorio)
+
+Con n = 4 por grupo la potencia estadística es muy limitada.
+El test de Wilcoxon-Mann-Whitney se reporta como referencia, pero los
+p-valores deben interpretarse con cautela.
+
+```{r alfa_test}
+alpha_tests <- lapply(c("observed", "shannon", "simpson"), function(metric) {
+  vals_cd   <- alpha_div |> filter(diagnosis == "CD") |> pull(!!sym(metric))
+  vals_ctrl <- alpha_div |> filter(diagnosis == "nonIBD") |> pull(!!sym(metric))
+  wt <- wilcox.test(vals_cd, vals_ctrl, exact = FALSE)
+  data.frame(
+    Métrica        = metric,
+    `Media CD`     = round(mean(vals_cd), 3),
+    `Media nonIBD` = round(mean(vals_ctrl), 3),
+    `W`            = wt$statistic,
+    `p-valor`      = round(wt$p.value, 4),
+    check.names    = FALSE
+  )
+}) |> bind_rows()
+
+alpha_tests |> ktbl(caption = "Test de Wilcoxon — diversidad alfa (CD vs nonIBD)")
+```
+
+Los valores de diversidad alfa muestran una elevada variabilidad dentro de cada grupo. En cuanto a riqueza observada, M2077 (nonIBD) destaca con 1013 especies detectadas, mientras que C3017 (CD) tiene apenas 366, siendo la muestra más empobrecida. Sin embargo, M2025 (CD) presenta la mayor diversidad Shannon del conjunto (H' = 3.196), superando a todos los controles sanos, lo que contradice la expectativa clásica de menor diversidad asociada a la enfermedad inflamatoria intestinal [1]. Este resultado ilustra que con n = 4 por grupo no existe una tendencia diagnóstica coherente: los rangos de los dos grupos se solapan ampliamente en las tres métricas.
+
+El índice de Simpson (1-D), que pondera más las especies dominantes, es en promedio ligeramente superior en CD (0.831) que en nonIBD (0.794), lo que sugiere que las comunidades en CD podrían estar más equitativas en términos de dominancia relativa — posiblemente porque la especie dominante (*Bacteroides*) no es tan abrumadoramente mayoritaria como en algunos controles. No obstante, el test de Wilcoxon confirma que ninguna de las tres métricas alcanza significación estadística (p > 0.46 en todos los casos), resultado esperable dado el tamaño muestral. La ausencia de diferencias significativas no debe interpretarse como equivalencia biológica entre grupos, sino como una limitación de potencia inherente al diseño de este análisis piloto.
+
+# Diversidad beta
+
+La diversidad beta cuantifica las **diferencias de composición entre muestras**: en vez de describir qué hay dentro de cada comunidad (diversidad alfa), mide cuánto se parecen o difieren unas muestras de otras.
+
+## La distancia de Bray-Curtis
+
+Para cuantificar esa diferencia se necesita una métrica de disimilitud entre pares de muestras. La **distancia de Bray-Curtis** es la más utilizada en estudios de microbioma intestinal, y es la que aplicaron Lloyd-Price et al. [1]. Se define como:
+
+$$BC_{ij} = 1 - \frac{2 \sum_k \min(p_{ik},\, p_{jk})}{\sum_k p_{ik} + \sum_k p_{jk}}$$
+
+donde $p_{ik}$ es la abundancia relativa de la especie $k$ en la muestra $i$. El numerador suma las abundancias compartidas (el mínimo entre las dos muestras para cada especie); el denominador es la abundancia total entre ambas. El resultado oscila entre **0** (comunidades idénticamente compuestas) y **1** (sin ninguna especie en común o con abundancias completamente distintas).
+
+¿Por qué es adecuada aquí? Porque:
+
+- Trabaja sobre **abundancias relativas**, no sobre presencia/ausencia — capta no solo qué especies hay, sino cuántas de cada una.
+- Es **robusta** ante especies raras: al usar el mínimo, las especies que aparecen en cantidades ínfimas en una sola muestra apenas influyen en el resultado.
+- No asume ninguna distribución estadística de los datos, lo que la hace apta para el rango dinámico muy amplio de las abundancias metagenómicas.
+- Es el **estándar de facto** en ecología de microbioma, permitiendo comparar resultados con la literatura.
+
+Una alternativa frecuente es la distancia de **Jaccard** (basada solo en presencia/ausencia), que no aprovecha la información cuantitativa de Bracken. Dado que Bracken proporciona estimaciones de abundancia, Bray-Curtis es la opción más informativa.
+
+## PCoA — Bray-Curtis
+
+A partir de la matriz de distancias de Bray-Curtis entre todas las muestras, se aplica un **Análisis de Coordenadas Principales (PCoA)**, una técnica de reducción de dimensionalidad que proyecta las 8 muestras en un espacio de ejes ortogonales que capturan la mayor parte de la variabilidad en disimilitud. Cada eje (PCoA1, PCoA2…) explica un porcentaje de la varianza total entre muestras; los porcentajes se indican en los ejes de la figura.
+
+```{r beta_pcoa, fig.height=6, fig.width=8}
+ps_rel_beta <- transform_sample_counts(ps, function(x) x / sum(x))
+bray_dist <- phyloseq::distance(ps_rel_beta, method = "bray")
+
+pcoa_res <- ordinate(ps_rel_beta, method = "PCoA", distance = bray_dist)
+
+eig_vals <- pcoa_res$values$Eigenvalues
+pct_var  <- round(100 * eig_vals / sum(eig_vals), 1)
+
+pcoa_df <- data.frame(
+  pcoa_res$vectors[, 1:2],
+  sample_meta[rownames(pcoa_res$vectors), ]
+)
+colnames(pcoa_df)[1:2] <- c("PCoA1", "PCoA2")
+
+pcoa_centroids <- pcoa_df |>
+  group_by(diagnosis) |>
+  summarise(PCoA1 = mean(PCoA1), PCoA2 = mean(PCoA2), .groups = "drop")
+
+pcoa_spiders <- pcoa_df |>
+  left_join(pcoa_centroids, by = "diagnosis", suffix = c("", "_c"))
+
+p_pcoa <- ggplot(pcoa_df, aes(x = PCoA1, y = PCoA2, color = diagnosis)) +
+  geom_segment(data = pcoa_spiders,
+               aes(xend = PCoA1_c, yend = PCoA2_c),
+               alpha = 0.3, linewidth = 0.5, show.legend = FALSE) +
+  stat_ellipse(aes(fill = diagnosis), geom = "polygon",
+               alpha = 0.10, level = 0.68, type = "norm",
+               show.legend = FALSE) +
+  geom_point(data = pcoa_centroids, aes(fill = diagnosis),
+             shape = 23, size = 5, color = "black",
+             stroke = 1.2, show.legend = FALSE) +
+  geom_point(aes(shape = sex), size = 4.5, alpha = 0.9) +
+  geom_text_repel(aes(label = Participant.ID), size = 3.5, max.overlaps = 10) +
+  scale_color_manual(values = color_dx) +
+  scale_fill_manual(values  = color_dx) +
+  labs(
+    x     = paste0("PCoA1 (", pct_var[1], "%)"),
+    y     = paste0("PCoA2 (", pct_var[2], "%)"),
+    title = "PCoA — Distancia de Bray-Curtis",
+    subtitle = "Elipses 68%; rombos: centroides; líneas: distancias al centroide",
+    color = "Diagnóstico", shape = "Sexo"
+  )
+p_pcoa
+ggsave(FIG("07_pcoa_bray_curtis.png"), p_pcoa, width = 8, height = 6, dpi = 300)
+```
+
+## PERMANOVA
+
+```{r permanova}
+meta_ordered <- sample_meta[labels(bray_dist), ]
+
+set.seed(42)
+perm_result <- adonis2(
+  bray_dist ~ diagnosis + sex,
+  data = meta_ordered,
+  permutations = 999
+)
+
+as.data.frame(perm_result) |>
+  rownames_to_column("Factor") |>
+  mutate(across(where(is.numeric), ~ round(.x, 4))) |>
+  rename(`R²` = R2, `p-valor` = `Pr(>F)`) |>
+  ktbl(caption = "PERMANOVA — Bray-Curtis ~ diagnosis + sex (999 permutaciones)")
+```
+
+El PCoA muestra que el primer eje (PCoA1, 60.1% de la varianza) separa a M2027 y M2042 del resto: ambas están dominadas por *Segatella* — M2042 es nonIBD y M2027 es CD —, lo que las desplaza fuertemente hacia la derecha respecto a las demás. Las otras tres muestras CD (C3016, C3017, M2025) se agrupan en el centro-izquierda junto con el resto de controles (M2039, M2079, M2077), sin mostrar una separación clara por diagnóstico. Los centroides de ambos grupos (rombos) son prácticamente coincidentes en PCoA2 y muy próximos en PCoA1, y las elipses de confianza al 68% se solapan ampliamente. Esto indica que la composición global no se estructura primariamente por el diagnóstico sino por diferencias individuales.
+
+El PERMANOVA confirma esta impresión visual: el modelo (diagnosis + sex) explica sólo el 24.5% de la varianza total en las distancias de Bray-Curtis (R² = 0.24), con un p-valor de 0.699 muy lejos de cualquier umbral de significación. El 75.5% restante corresponde a variabilidad residual entre individuos, dominante cuando n = 4 por grupo. Estos resultados no implican que CD y nonIBD sean composicionalmente equivalentes, sino que con este tamaño muestral la potencia es insuficiente para detectar diferencias estadísticamente significativas en la diversidad beta.
+
+## Índice de disbiosis {#dysbiosis}
+
+Siguiendo el enfoque de Lloyd-Price et al. [1] (Fig. 2C–E), se cuantifica
+la disbiosis como la **distancia media de Bray-Curtis de cada muestra respecto
+al centroide del grupo nonIBD**. Un valor mayor indica una composición más
+alejada del estado sano de referencia.
+
+```{r dysbiosis_index, fig.height=4.5, fig.width=7}
+bray_full <- as.matrix(bray_dist)
+non_ibd_samples <- rownames(meta_ordered)[meta_ordered$diagnosis == "nonIBD"]
+
+dysbiosis_scores <- sapply(rownames(bray_full), function(s) {
+  ref <- setdiff(non_ibd_samples, s)
+  mean(bray_full[s, ref])
+})
+
+dysbiosis_df <- data.frame(
+  sample       = names(dysbiosis_scores),
+  score        = dysbiosis_scores,
+  diagnosis    = as.character(meta_ordered[names(dysbiosis_scores), "diagnosis"]),
+  participante = as.character(meta_ordered[names(dysbiosis_scores), "Participant ID"])
+)
+
+mean_ctrl <- mean(dysbiosis_df$score[dysbiosis_df$diagnosis == "nonIBD"])
+
+p_disbiosis <- ggplot(dysbiosis_df,
+       aes(x = reorder(participante, score), y = score, fill = diagnosis)) +
+  geom_col(width = 0.6, color = "grey30", linewidth = 0.3) +
+  geom_hline(yintercept = mean_ctrl, linetype = "dashed", color = "grey40") +
+  annotate("text", x = 0.55, y = mean_ctrl + 0.015,
+           label = "Media nonIBD", hjust = 0, size = 3, color = "grey40") +
+  coord_flip() +
+  scale_fill_manual(values = color_dx) +
+  labs(x = NULL,
+       y = "Distancia media de Bray-Curtis al grupo nonIBD",
+       title = "Índice de disbiosis por muestra",
+       subtitle = "Mayor valor = composición más alejada del microbioma sano de referencia",
+       fill = "Diagnóstico")
+p_disbiosis
+ggsave(FIG("08_indice_disbiosis.png"), p_disbiosis, width = 7, height = 4.5, dpi = 300)
+```
+
+El índice de disbiosis revela una imagen contraintuitiva: M2042, una muestra **nonIBD**, presenta el mayor valor del conjunto (~0.80), muy por encima de la media del grupo control (~0.63). Esto se explica por su composición atípica dominada por *Segatella* (~60%), que la aleja notablemente del perfil de los demás controles (dominados por *Bacteroides* y *Phocaeicola*). Le sigue M2027 (CD, ~0.74) y M2077 (nonIBD, ~0.63).
+
+Las muestras CD no se agrupan sistemáticamente en los valores más altos: C3017 y M2025 tienen valores por debajo de la media nonIBD, mientras que C3016 está próximo a ella. Solo M2027 destaca como caso CD con alta disbiosis. Este resultado refuerza la conclusión del PERMANOVA: la heterogeneidad individual en cuanto a la distancia al centroide sano es mayor en nonIBD que entre grupos, lo que dificulta la discriminación diagnostica con tan pocas muestras.
+
+## Heatmap de distancias Bray-Curtis
+
+```{r heatmap_bray, fig.height=5, fig.width=6}
+bray_mat <- as.matrix(bray_dist)
+
+annot_df <- data.frame(
+  Diagnóstico = meta_ordered$diagnosis,
+  row.names = rownames(meta_ordered)
+)
+annot_colors <- list(Diagnóstico = color_dx)
+
+ph_bray <- pheatmap(
+  bray_mat,
+  annotation_row = annot_df,
+  annotation_col = annot_df,
+  annotation_colors = annot_colors,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 8,
+  main = "Distancias Bray-Curtis entre muestras",
+  fontsize = 9,
+  labels_row = meta_ordered$`Participant ID`,
+  labels_col = meta_ordered$`Participant ID`
+)
+png(FIG("09_heatmap_bray_curtis.png"), width = 6, height = 5, units = "in", res = 300)
+grid::grid.newpage()
+grid::grid.draw(ph_bray$gtable)
+dev.off()
+```
+
+El heatmap de distancias y el dendrograma jerárquico añaden precisión numérica a la PCoA. Lo más llamativo es que M2027 (CD) y M2042 (nonIBD), ambas dominadas por el enterotipo *Segatella*, son las más similares entre sí (BC = 0.29) y las más distintas del resto (BC = 0.74–0.90), hasta el punto de que el dendrograma las agrupa juntas y las separa completamente del resto. El clúster del resto de muestras (M2077, C3016, M2025, M2079, M2039, C3017) muestra distancias entre 0.31 y 0.59, con las muestras CD y nonIBD totalmente entremezcladas: C3017 y M2039 son las más próximas (BC = 0.31), pese a tener diagnósticos opuestos. En conjunto, el agrupamiento refleja el tipo de enterotipo (*Segatella* vs. *Bacteroides/Phocaeicola*) más que el estado de enfermedad, lo que de nuevo evidencia que la señal diagnóstica queda enmascarada por la variabilidad individual.
+
+Lloyd-Price et al. [1] (Fig. 2A–B) identificaron firmas taxonómicas
+consistentes en la EC disbiótica: **depleción** de productores de butirato
+(*F. prausnitzii*, *Roseburia* spp., *Subdoligranulum*) y **enriquecimiento**
+de facultativos (*E. coli*) y mucín-degradadores (*R. gnavus*, *R. torques*),
+además de cambios en *Prevotella copri* (actualmente *Segatella copri*).
+
+A continuación evaluamos la abundancia de estas especies en nuestras
+muestras, **empleando los nombres actuales de NCBI** junto con sus
+sinónimos.
+
+```{r taxa_clave, fig.height=8, fig.width=10}
+# Lista de taxa clave con nombres actuales Y antiguos (para buscar ambos)
+key_taxa_map <- tribble(
+  ~search_name,                     ~display_label,                  ~expected_in_cd,
+  "Faecalibacterium prausnitzii",   "F. prausnitzii",               "↓",
+  "Roseburia hominis",              "R. hominis",                    "↓",
+  "Roseburia intestinalis",         "R. intestinalis",               "↓",
+  "Subdoligranulum variabile",      "S. variabile",                  "↓",
+  "Alistipes finegoldii",           "A. finegoldii",                 "↓",
+  "Akkermansia muciniphila",        "A. muciniphila",                "↓",
+  "Agathobacter rectalis",          "A. rectalis (= E. rectale)",    "↓",
+  "Segatella copri",                "S. copri (= P. copri)",         "variable",
+  "Phocaeicola vulgatus",           "P. vulgatus (= B. vulgatus)",   "variable",
+  "Escherichia coli",               "E. coli",                       "↑",
+  "Mediterraneibacter gnavus",      "M. gnavus (= R. gnavus)",      "↑",
+  "Mediterraneibacter torques",     "M. torques (= R. torques)",     "↑",
+  "Veillonella parvula",            "V. parvula",                    "↑",
+  "Clostridium bolteae",            "C. bolteae",                    "↑"
+)
+
+# Buscar en los datos
+all_species <- rownames(otu_wide)
+found_exact <- key_taxa_map$search_name[key_taxa_map$search_name %in% all_species]
+not_found   <- key_taxa_map$search_name[!key_taxa_map$search_name %in% all_species]
+
+cat("Taxa clave detectados:", length(found_exact), "de", nrow(key_taxa_map), "\n")
+if (length(not_found) > 0) {
+  cat("No detectados (ausencia biológica o bajo umbral de detección):\n")
+  cat(" ", paste(not_found, collapse = "\n  "), "\n")
+}
+
+# Extraer abundancias relativas de los encontrados
+rel_key <- rel_df |>
+  filter(species %in% found_exact) |>
+  left_join(key_taxa_map, by = c("species" = "search_name")) |>
+  left_join(sample_labels |> select(Sample, `Participant ID`), by = "Sample")
+
+if (nrow(rel_key) > 0) {
+  # Ordenar: primero los ↓, luego variables, luego ↑
+  order_taxa <- rel_key |>
+    group_by(display_label, expected_in_cd) |>
+    summarise(max_abd = max(rel_abundance), .groups = "drop") |>
+    arrange(factor(expected_in_cd, levels = c("↓", "variable", "↑")),
+            desc(max_abd)) |>
+    pull(display_label)
+
+  rel_key <- rel_key |>
+    mutate(panel_label = paste0(sub(" \\(=.*", "", display_label), " [", expected_in_cd, "]"))
+
+  order_panels <- rel_key |>
+    distinct(display_label, panel_label, expected_in_cd) |>
+    arrange(factor(expected_in_cd, levels = c("↓", "variable", "↑"))) |>
+    pull(panel_label)
+
+  rel_key$panel_label <- factor(rel_key$panel_label, levels = order_panels)
+
+  p_taxa_clave <- ggplot(rel_key, aes(x = diagnosis, y = rel_abundance * 100, fill = diagnosis)) +
+    geom_boxplot(width = 0.5, alpha = 0.6, outlier.shape = NA) +
+    geom_jitter(width = 0.12, size = 2.5, alpha = 0.8, color = "grey20") +
+    facet_wrap(~ panel_label, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = color_dx) +
+    labs(x = NULL, y = "Abundancia relativa (%)",
+         title = "Especies clave en EC — Lloyd-Price et al. (2019)",
+         subtitle = "[↓] esperado reducido en CD; [↑] esperado enriquecido; [variable] sin dirección fija",
+         fill = "Diagnóstico") +
+    theme(strip.text = element_text(face = "italic", size = 8))
+  p_taxa_clave
+  ggsave(FIG("10_taxa_clave_especies_CD.png"), p_taxa_clave, width = 10, height = 8, dpi = 300)
+}
+```
+
+## Tabla resumen de taxa clave
+
+```{r tabla_taxa_clave}
+if (nrow(rel_key) > 0) {
+  taxa_summary <- rel_key |>
+    group_by(display_label, diagnosis, expected_in_cd) |>
+    summarise(
+      mean_pct = round(mean(rel_abundance * 100), 3),
+      sd_pct   = round(sd(rel_abundance * 100), 3),
+      .groups  = "drop"
+    ) |>
+    pivot_wider(
+      names_from = diagnosis,
+      values_from = c(mean_pct, sd_pct),
+      names_glue = "{diagnosis}_{.value}"
+    ) |>
+    mutate(
+      FC = round(ifelse(nonIBD_mean_pct > 0, CD_mean_pct / nonIBD_mean_pct, NA), 2),
+      consistente = case_when(
+        expected_in_cd == "↓" & !is.na(FC) & FC < 1 ~ "Sí",
+        expected_in_cd == "↑" & !is.na(FC) & FC > 1 ~ "Sí",
+        expected_in_cd == "variable" ~ "—",
+        TRUE ~ "No"
+      )
+    ) |>
+    arrange(factor(expected_in_cd, levels = c("↓", "variable", "↑")))
+
+  taxa_summary |>
+    mutate(
+      display_label = paste0("<em>", display_label, "</em>"),
+      consistente = cell_spec(
+        consistente, format = "html",
+        color = case_when(
+          consistente == "Sí" ~ "#1B5E20",
+          consistente == "No" ~ "#B71C1C",
+          TRUE ~ "grey50"
+        ),
+        bold = TRUE
+      )
+    ) |>
+    rename(
+      Especie = display_label, Esperado = expected_in_cd,
+      `CD media (%)` = CD_mean_pct, `CD SD` = CD_sd_pct,
+      `nonIBD media (%)` = nonIBD_mean_pct, `nonIBD SD` = nonIBD_sd_pct,
+      `FC (CD/nonIBD)` = FC, `¿Consistente?` = consistente
+    ) |>
+    ktbl(caption = "Abundancia de taxa clave — comparación con Lloyd-Price et al. (2019)")
+}
+```
+
+De las 12 especies analizadas, 5 son consistentes con la dirección esperada según Lloyd-Price et al. [1], 5 muestran la dirección contraria, y 2 (*S. copri* y *P. vulgatus*) se clasifican como "variable" sin expectativa definida. Entre los casos concordantes destacan *Agathobacter rectalis* (= *Eubacterium rectale*) y *Roseburia intestinalis*, productores de butirato depletados en CD (FC < 1), y *Escherichia coli* y *Veillonella parvula*, enriquecidos en CD (FC > 1). En sentido contrario, *Faecalibacterium prausnitzii* aparece ligeramente más abundante en CD que en nonIBD (FC = 1.14), contrariamente a su esperada depleción en enfermedad activa [4].
+
+Los casos más llamativos de inconsistencia son *Akkermansia muciniphila* (FC = 201) y *Alistipes finegoldii* (FC = 3.90), ambos con desviaciones estándar elevadas que reflejan presencia muy variable entre individuos — un patrón conocido para estas especies en estudios de microbioma intestinal. El fold-change extremo de *A. muciniphila* se explica porque tres de las cuatro muestras nonIBD tienen abundancia prácticamente nula, mientras que una muestra CD la detecta en mayor proporción; en este contexto, el FC pierde interpretabilidad como estimador de diferencia entre grupos.
+
+El ratio F/B es un marcador clásico de disbiosis intestinal, frecuentemente
+alterado en la EII [3].
+
+```{r ratio_fb, fig.height=4, fig.width=6}
+main_phyla <- c("Bacteroidota", "Bacillota")
+
+fb_ratio <- rel_df |>
+  filter(phylum %in% main_phyla) |>
+  group_by(Sample, diagnosis, phylum) |>
+  summarise(total_abd = sum(rel_abundance), .groups = "drop") |>
+  pivot_wider(names_from = phylum, values_from = total_abd, values_fill = 0) |>
+  mutate(FB_ratio = Bacillota / Bacteroidota) |>
+  left_join(sample_labels |> select(Sample, `Participant ID`), by = "Sample")
+
+fb_ratio |>
+  select(`Participant ID`, diagnosis, Bacillota, Bacteroidota, FB_ratio) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  rename(Participante = `Participant ID`, Diagnóstico = diagnosis,
+         `Firmicutes (rel.)` = Bacillota, `Bacteroidota (rel.)` = Bacteroidota,
+         `Ratio F/B` = FB_ratio) |>
+  ktbl(caption = "Ratio Firmicutes / Bacteroidota por muestra")
+
+p_ratio_fb <- ggplot(fb_ratio, aes(x = diagnosis, y = FB_ratio, fill = diagnosis)) +
+  geom_boxplot(width = 0.4, alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 3, color = "grey20") +
+  scale_fill_manual(values = color_dx) +
+  labs(x = NULL, y = "Ratio Firmicutes / Bacteroidota",
+       title = "Ratio F/B por diagnóstico",
+       fill = "Diagnóstico") +
+  theme(legend.position = "none")
+p_ratio_fb
+ggsave(FIG("11_ratio_firmicutes_bacteroidota.png"), p_ratio_fb, width = 6, height = 4, dpi = 300)
+```
+
+El ratio F/B es generalmente inferior a 1 en ambos grupos, lo que refleja la dominancia de Bacteroidota en todas las muestras. Las medianas son muy similares (nonIBD ~0.23, CD ~0.20) y los rangos se solapan ampliamente, con alta variabilidad en ambos grupos. M2077 (nonIBD) tiene el ratio más bajo de todo el conjunto (0.013), ya que está dominada casi exclusivamente por *Phocaeicola* y apenas contiene Bacillota. C3016 (CD) tiene el ratio más bajo en el grupo enfermo (0.083). Los valores más altos los presentan M2039 (nonIBD, 0.415) y M2025 (CD, 0.283).
+
+Aunque la literatura describe una reducción del ratio F/B en IBD respecto a controles sanos [3], este patrón no se observa aqui: si acaso, la tendencia es inversa (nonIBD ligeramente superior a CD), aunque sin ninguna significación estadística con n = 4 por grupo. Este resultado, junto con los demás análisis, apunta de nuevo a que la variabilidad individual domina sobre la señal diagnóstica.
+
+# Heatmap de las especies más variables
+
+Las 25 especies con mayor varianza en abundancia relativa entre muestras,
+representadas en escala log~10~ y escaladas por fila (*z*-score).
+
+```{r heatmap_especies, fig.height=9, fig.width=8}
+top_var_sp <- rel_df |>
+  group_by(species) |>
+  summarise(var_abd = var(rel_abundance), .groups = "drop") |>
+  slice_max(var_abd, n = 25) |>
+  pull(species)
+
+hm_mat <- rel_df |>
+  filter(species %in% top_var_sp) |>
+  select(Sample, species, rel_abundance) |>
+  pivot_wider(names_from = Sample, values_from = rel_abundance, values_fill = 0) |>
+  column_to_rownames("species") |>
+  as.matrix()
+
+hm_log <- log10(hm_mat + 1e-5)
+
+# Mostrar sinónimos en rownames
+rownames(hm_log) <- display_name(rownames(hm_log))
+
+# Renombrar columnas a Participant ID
+pid_map <- setNames(
+  as.character(sample_meta[colnames(hm_mat), "Participant ID"]),
+  colnames(hm_mat)
+)
+colnames(hm_log) <- unname(pid_map)
+
+annot_hm <- data.frame(
+  Diagnóstico = as.character(sample_meta[names(pid_map), "diagnosis"]),
+  row.names   = unname(pid_map)
+)
+
+ph_hm <- pheatmap(
+  hm_log,
+  annotation_col    = annot_hm,
+  annotation_colors = list(Diagnóstico = color_dx),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "row",
+  color             = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main              = "Top 25 especies por varianza — log10 (z-score por fila)",
+  fontsize_row      = 7,
+  fontsize_col      = 9,
+  border_color      = NA
+)
+png(FIG("12_heatmap_top25_especies_varianza.png"), width = 8, height = 9, units = "in", res = 300)
+grid::grid.newpage()
+grid::grid.draw(ph_hm$gtable)
+dev.off()
+```
+
+El heatmap muestra las 25 especies con mayor varianza entre muestras, expresadas en escala log~10~ y estandarizadas por fila (*z*-score), de modo que el color refleja el comportamiento relativo de cada especie respecto a su propia media: rojo indica abundancia superior a la media de esa especie, azul indica abundancia inferior.
+
+**Agrupamiento por columnas (muestras).** El dendrograma no recupera una separación por diagnóstico: muestras CD y nonIBD aparecen entremezcladas en todos los clústeres. M2027 (CD) queda claramente aislada del resto por su rama propia de gran longitud, reflejo directo de su perfil atípico dominado por *Segatella copri* y *Parabacteroides distasonis* con z-scores muy elevados. En el extremo opuesto, M2042 (nonIBD) y M2025 (CD) se agrupan entre sí, pese a pertenecer a grupos diagnósticos distintos. Esta distribución es coherente con el resultado del PERMANOVA: la variabilidad interindividual supera a la señal de diagnóstico.
+
+**Agrupamiento por filas (especies).** Las 25 especies se organizan en varios grupos funcionales reconocibles. El bloque superior agrupa principalmente Bacteroides y Parabacteroides (*B. cellulosilyticus*, *B. stercoris*, *B. salyersiae*, *B. thetaiotaomicron*, *Phocaeicola vulgatus*, *B. xylanisolvens*, *B. caccae*, *B. uniformis*, *B. ovatus*, *Alistipes* spp.), que representan el ecosistema dominante en la mayoría de muestras pero con alta varianza entre individuos. El bloque inferior reúne a *Segatella copri* (= *Prevotella copri*) y *Parabacteroides distasonis*, junto con las tres formas de *Faecalibacterium* detectadas (*F. prausnitzii*, *Faecalibacterium* sp. IP-1-18 y *Faecalibacterium* sp. I4-1-79).
+
+**Patrones destacables.**
+
+- *Segatella copri* (fila inferior) presenta un z-score igualmente elevado en M2027 (CD) y M2042 (nonIBD), confirmando que ambas muestras están en un estado de enterotipo Prevotella de intensidad comparable. El resto del conjunto muestra valores neutros o negativos para esta especie.
+
+- *Carjivirus communis* presenta el z-score más alto del conjunto en M2039 (nonIBD), en concordancia con la elevada proporción de Uroviricota detectada en esa muestra a nivel de filo.
+
+- Las tres formas de *Faecalibacterium* detectadas (*F. prausnitzii* y dos especies sin nombre formal) no muestran ningún patrón asociado al diagnóstico.
+
+- *Simiaoa suinii* y *Wujia chipingensis* destacan con z-scores extremadamente positivos en una o dos muestras y valores muy negativos en el resto, indicando presencia puntual y alta asimetría distribucional — el mismo fenómeno observado en los fold-changes extremos de la sección de taxa clave.
+
+En conjunto, el heatmap traduce visualmente lo observado en PCoA y diversidad alfa: la composición microbiana está determinada principalmente por el estado individual de cada microbioma (enterotipo Segatella, riqueza de Bacteroides, taxa esporádicos) y no por el diagnóstico de CD frente a nonIBD.
+
+# Resumen e interpretación
+
+El análisis reproduce a nivel cualitativo los patrones estructurales descritos por Lloyd-Price et al. [1], con la variabilidad interindividual como factor dominante por encima del diagnóstico.
+
+La composición está dominada por Bacteroidota en las 8 muestras. El hallazgo más llamativo es el enterotipo *Segatella copri* con igual intensidad en M2027 (CD) y M2042 (nonIBD), ilustrando que este estado puede coexistir con o sin enfermedad inflamatoria activa. La diversidad alfa no muestra diferencias significativas entre grupos; la diversidad beta tampoco (PERMANOVA p = 0.699, R² = 0.24), resultado coherente con la actividad clínica leve de las muestras seleccionadas (HBI = 5–6).
+
+De los 10 taxa clave con dirección esperada según Lloyd-Price et al. [1], 5 reproducen el patrón descrito y 5 no. El heatmap de varianza y el índice de disbiosis confirman la heterogeneidad compositiva sin separación por diagnóstico.
+
+# Referencias
+
+1. Lloyd-Price J, Arze C, Ananthakrishnan AN, et al. Multi-omics of the gut microbial ecosystem in inflammatory bowel diseases. *Nature*. 2019;569:655-62.
+2. Human Microbiome Project Consortium. Structure, function and diversity of the healthy human microbiome. *Nature*. 2012;486:207-14.
+3. Magne F, Gotteland M, Gauthier L, et al. The Firmicutes/Bacteroidetes ratio: a relevant marker of gut dysbiosis in obese patients? *Nutrients*. 2020;12(5):1474.
+4. Sokol H, Pigneur B, Watterlot L, et al. *Faecalibacterium prausnitzii* is an anti-inflammatory commensal bacterium identified by gut microbiota analysis of Crohn disease patients. *Proc Natl Acad Sci USA*. 2008;105(43):16731-6.
+
+# Entorno de ejecución
+
+```{r session_info}
+sessionInfo()
+```
