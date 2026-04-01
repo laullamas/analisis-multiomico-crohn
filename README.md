@@ -22,7 +22,7 @@ transcriptomica_mod_a/
 ├── Extraer muestras/            # Scripts de selección y filtrado de muestras
 ├── Galaxy/                      # Resultados del análisis DESeq2 ejecutado en Galaxy
 ├── Volcano/                     # Generación del Volcano plot
-└── nextflow_transcriptomica/    # Pipeline Nextflow DSL2
+└── Nextflow Transcriptomica/    # Pipeline Nextflow DSL2
 ```
 
 ## Módulo B — Metagenómica (`metagenomica_mod_b/`)
@@ -31,6 +31,7 @@ transcriptomica_mod_a/
 metagenomica_mod_b/
 ├── seleccion_muestras/          # Selección y filtrado de muestras (R Markdown)
 ├── nextflow_metagenomica/       # Pipeline Nextflow DSL2 
-└── analisis_metagenomico/       # Análisis estadístico y figuras (R Markdown)
+├── analisis_metagenomico/       # Análisis estadístico y figuras (R Markdown)
+└── multiqc_reports/             # Informes MultiQC: QC raw (Falco), post-trimming (fastp) y alineamiento (Bowtie2)
 ```
 
